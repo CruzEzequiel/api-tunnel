@@ -25,7 +25,7 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).parent.parent
 CLIENT_ENV = ROOT / "client" / ".env"
 CLIENT_SCRIPT = ROOT / "client" / "tunnel.py"
 
