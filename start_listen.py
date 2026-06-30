@@ -16,7 +16,7 @@ VENV_DIR = ROOT / ".venv"
 VENV_PYTHON = VENV_DIR / "bin" / "python"
 CLIENT_ENV = ROOT / "client" / ".env"
 CLIENT_REQ = ROOT / "client" / "requirements.txt"
-CLIENT_SCRIPT = ROOT / "client" / "tunnel.py"
+CLIENT_DIR = ROOT / "client"
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -40,15 +40,22 @@ def ensure_venv() -> None:
 
 def ensure_deps() -> None:
     marker = VENV_DIR / ".deps_installed"
-    if marker.exists():
+    requirements = CLIENT_REQ.read_text()
+    if marker.exists() and marker.read_text() == requirements:
         return
     print("Instalando dependencias del cliente...")
     subprocess.run(
         [str(VENV_PYTHON), "-m", "pip", "install", "-q", "-r", str(CLIENT_REQ)],
         check=True,
     )
-    marker.touch()
+    marker.write_text(requirements)
     print("✓ Dependencias instaladas")
+
+
+def relaunch_with_venv() -> None:
+    if Path(sys.prefix).resolve() == VENV_DIR.resolve():
+        return
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
 def validate_config(config: dict) -> None:
@@ -57,6 +64,45 @@ def validate_config(config: dict) -> None:
         print(f"✗ Falta configuración en {CLIENT_ENV}: {', '.join(missing)}")
         print(f"  Corré python3 scripts/setup.py primero.")
         sys.exit(1)
+
+
+async def run_tunnel_loop(config: dict, monitor) -> None:
+    import asyncio
+    import tunnel
+
+    backoff_state = {"current": config["RECONNECT_BACKOFF"]}
+    backoff_max = config["RECONNECT_BACKOFF_MAX"]
+
+    while True:
+        await tunnel.run_session(config, backoff_state, on_connected=monitor.set_connected)
+        tunnel.log(f"✗ Conexión perdida — reintentando en {backoff_state['current']}s")
+        await asyncio.sleep(backoff_state["current"])
+        backoff_state["current"] = min(backoff_state["current"] * 2, backoff_max)
+
+
+async def run_all(config: dict) -> None:
+    import asyncio
+    from monitor import MonitorServer
+    from traffic import log as traffic_log
+
+    monitor_port = int(os.environ.get("MONITOR_PORT", "4040"))
+    monitor = MonitorServer(traffic_log, config, port=monitor_port)
+    await monitor.start()
+    print(f"  MONITOR      http://localhost:{monitor_port}")
+    print()
+
+    tunnel_task = asyncio.create_task(run_tunnel_loop(config, monitor))
+    try:
+        await asyncio.sleep(float("inf"))
+    except asyncio.CancelledError:
+        pass
+    finally:
+        tunnel_task.cancel()
+        try:
+            await tunnel_task
+        except asyncio.CancelledError:
+            pass
+        await monitor.stop()
 
 
 def main() -> None:
@@ -77,28 +123,29 @@ def main() -> None:
 
     target_url = f"http://localhost:{port}" if port else config.get("TARGET_URL", "http://localhost:8000")
 
+    ensure_venv()
+    ensure_deps()
+    relaunch_with_venv()
+
     print("╔══════════════════════════════════════════╗")
     print("║           baxe-tunnel                    ║")
     print("╚══════════════════════════════════════════╝")
     print()
     print(f"  BRIDGE_URL   {config['BRIDGE_URL']}")
     print(f"  TARGET_URL   {target_url}")
-    print()
 
-    ensure_venv()
-    ensure_deps()
-
-    print()
     print("──────────────────────────────────────────")
 
-    env = os.environ.copy()
-    env["TARGET_URL"] = target_url
+    sys.path.insert(0, str(CLIENT_DIR))
+    os.environ.update(config)
+    os.environ["TARGET_URL"] = target_url
+
+    import asyncio
+    import tunnel
+    runtime_config = tunnel.load_config()
 
     try:
-        subprocess.run(
-            [str(VENV_PYTHON), str(CLIENT_SCRIPT)],
-            env=env,
-        )
+        asyncio.run(run_all(runtime_config))
     except KeyboardInterrupt:
         pass
 

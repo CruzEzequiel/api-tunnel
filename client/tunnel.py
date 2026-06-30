@@ -3,11 +3,14 @@ import base64
 import json
 import os
 import sys
+import time
 from datetime import datetime
+from typing import Callable
 
 import httpx
 import websockets
 from dotenv import load_dotenv
+from traffic import TrafficEntry, log as traffic_log
 from websockets.exceptions import InvalidStatus, WebSocketException
 
 load_dotenv()
@@ -84,8 +87,18 @@ def to_ws_url(bridge_url: str) -> str:
 
 
 async def handle_request(config: dict, websocket, message: dict) -> None:
-    headers = {k: v for k, v in message["headers"]}
+    started = time.perf_counter()
+    request_headers = [(str(k), str(v)) for k, v in message["headers"]]
+    headers = {k: v for k, v in request_headers}
     body = base64.b64decode(message["body_b64"])
+    entry = TrafficEntry(
+        id=message["id"],
+        method=message["method"],
+        path=message["path"],
+        query=[(str(k), str(v)) for k, v in message["query"]],
+        request_headers=request_headers,
+        request_body=body,
+    )
 
     params = message["query"]
     target = httpx.URL(config["TARGET_URL"].rstrip("/"))
@@ -106,14 +119,24 @@ async def handle_request(config: dict, websocket, message: dict) -> None:
     try:
         upstream = await target_client.send(req)
     except httpx.RequestError as exc:
+        entry.error = str(exc)
+        entry.elapsed_ms = int((time.perf_counter() - started) * 1000)
+        traffic_log.add(entry)
         response = {
             "type": "http_response",
             "id": message["id"],
             "error": "target_unreachable",
             "detail": str(exc),
         }
-        await websocket.send(json.dumps(response))
+        async with config["WS_SEND_LOCK"]:
+            await websocket.send(json.dumps(response))
         return
+
+    entry.status = upstream.status_code
+    entry.response_headers = list(upstream.headers.items())
+    entry.response_body = upstream.content
+    entry.elapsed_ms = int((time.perf_counter() - started) * 1000)
+    traffic_log.add(entry)
 
     response = {
         "type": "http_response",
@@ -122,11 +145,16 @@ async def handle_request(config: dict, websocket, message: dict) -> None:
         "headers": list(upstream.headers.items()),
         "body_b64": base64.b64encode(upstream.content).decode("ascii"),
     }
-    await websocket.send(json.dumps(response))
+    async with config["WS_SEND_LOCK"]:
+        await websocket.send(json.dumps(response))
 
 
 
-async def run_session(config: dict, backoff_state: dict) -> None:
+async def run_session(
+    config: dict,
+    backoff_state: dict,
+    on_connected: Callable[[bool], None] | None = None,
+) -> None:
     log("Conectando...")
 
     try:
@@ -145,16 +173,32 @@ async def run_session(config: dict, backoff_state: dict) -> None:
                 print("                          Verifica que ambos lados usen los mismos tokens.")
                 sys.exit(1)
 
+            config["WS_SEND_LOCK"] = asyncio.Lock()
             log(f"✓ Tunnel activo → {config['TARGET_URL']}")
+            if on_connected:
+                on_connected(True)
             backoff_state["current"] = config["RECONNECT_BACKOFF"]
 
             async for raw in websocket:
                 message = json.loads(raw)
                 if message.get("type") == "http_request":
-                    asyncio.create_task(handle_request(config, websocket, message))
+                    task = asyncio.create_task(handle_request(config, websocket, message))
+                    task.add_done_callback(_log_task_exception)
 
     except (OSError, InvalidStatus, WebSocketException, asyncio.TimeoutError, TimeoutError):
         return
+    finally:
+        if on_connected:
+            on_connected(False)
+
+
+def _log_task_exception(task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        log(f"✗ Error manejando request: {exc}")
 
 
 async def run_async() -> None:
