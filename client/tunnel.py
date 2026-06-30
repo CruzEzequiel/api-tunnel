@@ -118,6 +118,7 @@ async def handle_request(config: dict, websocket, message: dict) -> None:
     await websocket.send(json.dumps(response))
 
 
+
 async def run_session(config: dict, backoff_state: dict) -> None:
     log("Conectando...")
 
@@ -127,7 +128,8 @@ async def run_session(config: dict, backoff_state: dict) -> None:
             hello_response = json.loads(await websocket.recv())
 
             if hello_response.get("type") != "hello_ack":
-                log(f"✗ Conexión rechazada por el bridge: {hello_response.get('error')}")
+                error = hello_response.get("error")
+                log(f"✗ Conexión rechazada por el bridge: {error}")
                 return
 
             if hello_response.get("recv_token") != config["RECV_TOKEN"]:

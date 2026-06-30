@@ -56,9 +56,14 @@ async def tunnel_ws(websocket: WebSocket):
         return
 
     if state["ws"] is not None:
-        await websocket.send_json({"type": "hello_rejected", "error": "tunnel_already_active"})
-        await websocket.close(code=4409)
-        return
+        old_ws = state["ws"]
+        state["ws"] = None
+        state["ws_send_lock"] = None
+        _fail_all_pending("tunnel_replaced")
+        try:
+            await old_ws.close(code=1001)
+        except Exception:
+            pass
 
     state["ws"] = websocket
     state["ws_send_lock"] = asyncio.Lock()
