@@ -83,6 +83,15 @@ async def tunnel_status():
     return {"connected": state["ws"] is not None}
 
 
+@app.delete("/_tunnel/disconnect")
+async def tunnel_disconnect():
+    ws = state["ws"]
+    if ws is None:
+        return JSONResponse({"error": "No tunnel active"}, status_code=404)
+    await ws.close(code=1001)
+    return {"status": "disconnected"}
+
+
 @app.api_route(
     "/{full_path:path}",
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
