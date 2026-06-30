@@ -1,49 +1,86 @@
+import asyncio
+import base64
+import json
 import os
+import uuid
 
-import httpx
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 SEND_TOKEN = os.environ.get("SEND_TOKEN", "")
 RECV_TOKEN = os.environ.get("RECV_TOKEN", "")
+REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "30"))
 
 app = FastAPI()
 
-state = {"target_url": None}
-
-http_client = httpx.AsyncClient()
+state = {
+    "ws": None,
+    "ws_send_lock": None,
+    "pending": {},
+}
 
 HOP_BY_HOP_HEADERS = {"host", "content-length"}
 
 
-@app.post("/_tunnel/connect")
-async def tunnel_connect(request: Request):
-    body = await request.json()
-
-    if body.get("send_token") != SEND_TOKEN:
-        return JSONResponse({"error": "invalid send_token"}, status_code=401)
-
-    target_url = body.get("target_url")
-    if not target_url:
-        return JSONResponse({"error": "target_url required"}, status_code=400)
-
-    state["target_url"] = target_url.rstrip("/")
-
-    return {"recv_token": RECV_TOKEN}
+def _resolve_pending(message: dict) -> None:
+    future = state["pending"].pop(message.get("id"), None)
+    if future is not None and not future.done():
+        future.set_result(message)
 
 
-@app.delete("/_tunnel/disconnect")
-async def tunnel_disconnect():
-    state["target_url"] = None
-    return {"status": "disconnected"}
+def _fail_all_pending(reason: str) -> None:
+    for future in state["pending"].values():
+        if not future.done():
+            future.set_exception(RuntimeError(reason))
+    state["pending"].clear()
+
+
+@app.websocket("/_tunnel/ws")
+async def tunnel_ws(websocket: WebSocket):
+    await websocket.accept()
+
+    try:
+        hello_raw = await websocket.receive_text()
+    except WebSocketDisconnect:
+        return
+
+    try:
+        hello = json.loads(hello_raw)
+    except json.JSONDecodeError:
+        await websocket.close(code=4400)
+        return
+
+    if hello.get("type") != "hello" or hello.get("send_token") != SEND_TOKEN:
+        await websocket.send_json({"type": "hello_rejected", "error": "invalid_send_token"})
+        await websocket.close(code=4401)
+        return
+
+    if state["ws"] is not None:
+        await websocket.send_json({"type": "hello_rejected", "error": "tunnel_already_active"})
+        await websocket.close(code=4409)
+        return
+
+    state["ws"] = websocket
+    state["ws_send_lock"] = asyncio.Lock()
+    await websocket.send_json({"type": "hello_ack", "recv_token": RECV_TOKEN})
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            message = json.loads(raw)
+            if message.get("type") == "http_response":
+                _resolve_pending(message)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        _fail_all_pending("tunnel_disconnected")
+        state["ws"] = None
+        state["ws_send_lock"] = None
 
 
 @app.get("/_tunnel/status")
 async def tunnel_status():
-    return {
-        "connected": state["target_url"] is not None,
-        "target_url": state["target_url"],
-    }
+    return {"connected": state["ws"] is not None}
 
 
 @app.api_route(
@@ -51,40 +88,55 @@ async def tunnel_status():
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
 )
 async def proxy(full_path: str, request: Request):
-    target_url = state["target_url"]
-    if not target_url:
+    websocket = state["ws"]
+    if websocket is None:
         return JSONResponse({"error": "No tunnel active"}, status_code=503)
 
-    url = f"{target_url}/{full_path}"
-
-    headers = {
-        k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP_HEADERS
-    }
-
+    request_id = str(uuid.uuid4())
     body = await request.body()
 
+    message = {
+        "type": "http_request",
+        "id": request_id,
+        "method": request.method,
+        "path": f"/{full_path}",
+        "query": list(request.query_params.multi_items()),
+        "headers": [
+            [k, v] for k, v in request.headers.items()
+            if k.lower() not in HOP_BY_HOP_HEADERS
+        ],
+        "body_b64": base64.b64encode(body).decode("ascii"),
+    }
+
+    future = asyncio.get_running_loop().create_future()
+    state["pending"][request_id] = future
+
     try:
-        upstream_response = await http_client.request(
-            request.method,
-            url,
-            headers=headers,
-            params=request.query_params,
-            content=body,
-            timeout=30.0,
-        )
-    except httpx.RequestError as exc:
+        async with state["ws_send_lock"]:
+            await websocket.send_text(json.dumps(message))
+
+        response_message = await asyncio.wait_for(future, timeout=REQUEST_TIMEOUT)
+    except asyncio.TimeoutError:
+        state["pending"].pop(request_id, None)
+        return JSONResponse({"error": "Tunnel client timed out"}, status_code=504)
+    except Exception as exc:
+        state["pending"].pop(request_id, None)
+        return JSONResponse({"error": f"Tunnel disconnected: {exc}"}, status_code=502)
+
+    if "error" in response_message:
+        detail = response_message.get("detail", response_message["error"])
         return JSONResponse(
-            {"error": f"Failed to reach target: {exc}"}, status_code=502
+            {"error": f"Failed to reach target: {detail}"}, status_code=502
         )
 
     response_headers = {
-        k: v
-        for k, v in upstream_response.headers.items()
+        k: v for k, v in response_message["headers"]
         if k.lower() not in HOP_BY_HOP_HEADERS
     }
+    response_body = base64.b64decode(response_message["body_b64"])
 
     return Response(
-        content=upstream_response.content,
-        status_code=upstream_response.status_code,
+        content=response_body,
+        status_code=response_message["status"],
         headers=response_headers,
     )

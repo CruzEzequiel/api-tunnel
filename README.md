@@ -11,6 +11,14 @@ Tunnel HTTP para exponer un puerto local a internet a través de un bridge propi
 - Compartir un servidor de desarrollo sin ngrok ni dependencias externas
 
 ---
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r client/requirements.txt
+pip install -r bridge/requirements.txt
+---
+
+
+---
 
 ## Setup inicial (una sola vez)
 
@@ -38,7 +46,10 @@ Usando la [consola de Google Cloud](https://console.cloud.google.com/run):
 2. Elegí **Continuously deploy from a repository** (o **Deploy one revision from an existing container** si preferís subir la imagen vos mismo) y apuntá al repo — el `Dockerfile` está en la raíz, así que no hace falta indicar un subdirectorio de build.
 3. En **Authentication**, marcá **Allow unauthenticated invocations** (la autenticación la maneja el doble token de la app, no IAM).
 4. En **Variables & Secrets → Environment variables**, agregá `SEND_TOKEN` y `RECV_TOKEN` con los valores generados en el paso 1.
-5. Creá el servicio. Cloud Run inyecta `PORT` automáticamente; la imagen ya escucha en 8080.
+5. En **Networking/Capacity**, configurá:
+   - **Minimum instances: 0** y **Maximum instances: 1** — puede escalar a cero cuando no usás la PC; `max-instances=1` es imprescindible porque el túnel vive en memoria de proceso (ver [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)).
+   - **Request timeout: 3600** (60 min, el máximo permitido) — define cada cuánto el cliente necesita reconectar el WebSocket.
+6. Creá el servicio. Cloud Run inyecta `PORT` automáticamente; la imagen ya escucha en 8080.
 
 Al finalizar, la consola muestra la URL pública del servicio (algo como `https://baxe-tunnel-bridge-xxxxx.run.app`). Completá esa URL como `BRIDGE_URL` en `client/.env`.
 
@@ -71,7 +82,7 @@ curl https://tu-bridge.run.app/_tunnel/status
 ```
 
 ```json
-{"connected": true, "target_url": "http://localhost:8000"}
+{"connected": true}
 ```
 
 ---

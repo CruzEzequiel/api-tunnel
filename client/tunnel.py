@@ -1,14 +1,20 @@
+import asyncio
+import base64
+import json
 import os
 import sys
-import time
 from datetime import datetime
 
 import httpx
+import websockets
 from dotenv import load_dotenv
+from websockets.exceptions import InvalidStatus, WebSocketException
 
 load_dotenv()
 
 REQUIRED_VARS = ["BRIDGE_URL", "TARGET_URL", "SEND_TOKEN", "RECV_TOKEN"]
+
+target_client = httpx.AsyncClient()
 
 
 def now() -> str:
@@ -68,55 +74,99 @@ def validate_config(config: dict) -> None:
             sys.exit(1)
 
 
-def connect(config: dict) -> bool:
-    log("Conectando...")
+def to_ws_url(bridge_url: str) -> str:
+    url = bridge_url.rstrip("/")
+    if url.startswith("https://"):
+        url = "wss://" + url[len("https://"):]
+    elif url.startswith("http://"):
+        url = "ws://" + url[len("http://"):]
+    return url + "/_tunnel/ws"
 
-    url = f"{config['BRIDGE_URL'].rstrip('/')}/_tunnel/connect"
+
+async def handle_request(config: dict, websocket, message: dict) -> None:
+    headers = {k: v for k, v in message["headers"]}
+    body = base64.b64decode(message["body_b64"])
+    url = config["TARGET_URL"].rstrip("/") + message["path"]
 
     try:
-        response = httpx.post(
+        upstream = await target_client.request(
+            message["method"],
             url,
-            json={
-                "send_token": config["SEND_TOKEN"],
-                "target_url": config["TARGET_URL"],
-            },
-            timeout=10.0,
+            headers=headers,
+            params=message["query"],
+            content=body,
+            timeout=30.0,
         )
-    except httpx.RequestError:
-        return False
+    except httpx.RequestError as exc:
+        response = {
+            "type": "http_response",
+            "id": message["id"],
+            "error": "target_unreachable",
+            "detail": str(exc),
+        }
+        await websocket.send(json.dumps(response))
+        return
 
-    if response.status_code != 200:
-        return False
-
-    data = response.json()
-    if data.get("recv_token") != config["RECV_TOKEN"]:
-        log("⚠️  Bridge no verificado — abortando")
-        print("                          El RECV_TOKEN recibido no coincide con el esperado.")
-        print("                          Verifica que ambos lados usen los mismos tokens.")
-        sys.exit(1)
-
-    log(f"✓ Tunnel activo → {config['TARGET_URL']}")
-    return True
+    response = {
+        "type": "http_response",
+        "id": message["id"],
+        "status": upstream.status_code,
+        "headers": list(upstream.headers.items()),
+        "body_b64": base64.b64encode(upstream.content).decode("ascii"),
+    }
+    await websocket.send(json.dumps(response))
 
 
-def run() -> None:
+async def run_session(config: dict, backoff_state: dict) -> None:
+    log("Conectando...")
+
+    try:
+        async with websockets.connect(to_ws_url(config["BRIDGE_URL"]), open_timeout=10) as websocket:
+            await websocket.send(json.dumps({"type": "hello", "send_token": config["SEND_TOKEN"]}))
+            hello_response = json.loads(await websocket.recv())
+
+            if hello_response.get("type") != "hello_ack":
+                log(f"✗ Conexión rechazada por el bridge: {hello_response.get('error')}")
+                return
+
+            if hello_response.get("recv_token") != config["RECV_TOKEN"]:
+                log("⚠️  Bridge no verificado — abortando")
+                print("                          El RECV_TOKEN recibido no coincide con el esperado.")
+                print("                          Verifica que ambos lados usen los mismos tokens.")
+                sys.exit(1)
+
+            log(f"✓ Tunnel activo → {config['TARGET_URL']}")
+            backoff_state["current"] = config["RECONNECT_BACKOFF"]
+
+            async for raw in websocket:
+                message = json.loads(raw)
+                if message.get("type") == "http_request":
+                    asyncio.create_task(handle_request(config, websocket, message))
+
+    except (OSError, InvalidStatus, WebSocketException, asyncio.TimeoutError, TimeoutError):
+        return
+
+
+async def run_async() -> None:
     config = load_config()
     print_banner(config)
     validate_config(config)
 
-    backoff = config["RECONNECT_BACKOFF"]
+    backoff_state = {"current": config["RECONNECT_BACKOFF"]}
     backoff_max = config["RECONNECT_BACKOFF_MAX"]
 
     while True:
-        if connect(config):
-            break
+        await run_session(config, backoff_state)
+        log(f"✗ Conexión perdida — reintentando en {backoff_state['current']}s")
+        await asyncio.sleep(backoff_state["current"])
+        backoff_state["current"] = min(backoff_state["current"] * 2, backoff_max)
 
-        log(f"✗ Conexión fallida — reintentando en {backoff}s")
-        time.sleep(backoff)
-        backoff = min(backoff * 2, backoff_max)
 
-    while True:
-        time.sleep(3600)
+def run() -> None:
+    try:
+        asyncio.run(run_async())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

@@ -5,11 +5,13 @@ Documentación técnica del funcionamiento interno. Para instrucciones de uso ve
 ## Cómo funciona
 
 ```
-Internet → Bridge (Cloud Run) → Tu máquina local
-           dominio fijo          localhost:8000
+Internet → Bridge (Cloud Run) ⇄ WebSocket persistente ⇄ Cliente (tu máquina)
+           dominio fijo                                  localhost:8000
 ```
 
-El bridge actúa como proxy transparente: preserva método, path, headers, body y query params. Solo acepta conexiones que presenten el `SEND_TOKEN` correcto, y el cliente verifica que el bridge responda con el `RECV_TOKEN` correcto — ambos lados se autentican mutuamente.
+El cliente abre una conexión WebSocket saliente y persistente hacia el bridge — es un túnel inverso real, no un proxy que el bridge pueda alcanzar directamente. El bridge no puede conectarse a `localhost` de tu máquina (no existe ruta de red para eso); en cambio, reenvía cada request HTTP entrante a través de esa conexión WebSocket, el cliente lo ejecuta contra `TARGET_URL` y devuelve la respuesta por el mismo canal.
+
+Ambos lados se autentican mutuamente en el handshake del WebSocket: el cliente debe presentar el `SEND_TOKEN` correcto, y el bridge debe responder con el `RECV_TOKEN` correcto.
 
 ---
 
@@ -39,32 +41,80 @@ El `Dockerfile` vive en la raíz del repo (no dentro de `bridge/`) para que `gcl
 
 ## Bridge (`bridge/main.py`)
 
-FastAPI app deployada en Cloud Run. Recibe el tráfico de internet y lo reenvía al cliente local registrado. Es completamente stateless excepto por el `target_url` actual, que vive en memoria del proceso.
+FastAPI app deployada en Cloud Run. Mantiene como mucho un túnel activo a la vez: la conexión WebSocket del cliente actual vive en `state["ws"]` (en memoria del proceso).
 
-### Endpoints internos
+### Endpoints
 
 | Método | Path | Descripción |
 |--------|------|-------------|
-| POST | `/_tunnel/connect` | Registra el target local |
-| DELETE | `/_tunnel/disconnect` | Limpia el target |
-| GET | `/_tunnel/status` | Estado actual del tunnel |
+| WS | `/_tunnel/ws` | Conexión persistente del cliente. Handshake + canal de mensajes `http_request`/`http_response`. |
+| GET | `/_tunnel/status` | `{"connected": true/false}` según si hay un WebSocket activo. |
 
-### Endpoint proxy
+Cualquier otro request (`/{full_path:path}`, cualquier método) se trata como tráfico a reenviar al cliente conectado.
 
-Cualquier request que no empiece con `/_tunnel/` se reenvía al target registrado preservando:
-- Método HTTP
-- Path completo
-- Query params
-- Headers (excepto `host` y `content-length`)
-- Body
+### Protocolo sobre el WebSocket
 
-Si no hay ningún cliente conectado, responde `503 — No tunnel active`.
+**Handshake:**
+
+1. Cliente conecta a `wss://<bridge>/_tunnel/ws` y manda:
+   ```json
+   {"type": "hello", "send_token": "..."}
+   ```
+2. Bridge valida `send_token`. Si es inválido, o ya hay un túnel activo, responde `hello_rejected` y cierra la conexión:
+   ```json
+   {"type": "hello_rejected", "error": "invalid_send_token"}
+   {"type": "hello_rejected", "error": "tunnel_already_active"}
+   ```
+3. Si es válido, responde:
+   ```json
+   {"type": "hello_ack", "recv_token": "..."}
+   ```
+   y el cliente queda como túnel activo.
+
+**Reenvío de requests (bridge → cliente):**
+
+Por cada request HTTP externo, el bridge genera un `id` único y manda:
+
+```json
+{
+  "type": "http_request",
+  "id": "a1b2c3d4-...",
+  "method": "POST",
+  "path": "/webhook/test",
+  "query": [["key", "value"]],
+  "headers": [["content-type", "application/json"]],
+  "body_b64": "eyJldmVudCI6InBpbmcifQ=="
+}
+```
+
+`headers` y `query` van como listas de pares (no dict) porque HTTP permite valores repetidos. El body siempre viaja en base64, sin distinguir texto de binario.
+
+**Respuesta (cliente → bridge):**
+
+```json
+{
+  "type": "http_response",
+  "id": "a1b2c3d4-...",
+  "status": 200,
+  "headers": [["content-type", "application/json"]],
+  "body_b64": "eyJvayI6dHJ1ZX0="
+}
+```
+
+Si el cliente no pudo alcanzar `TARGET_URL`:
+
+```json
+{"type": "http_response", "id": "a1b2c3d4-...", "error": "target_unreachable", "detail": "Connection refused"}
+```
+
+El bridge correla cada respuesta con su request original por `id` (puede haber varios requests concurrentes compartiendo la misma conexión WebSocket). Si no hay túnel activo, responde `503 — No tunnel active`. Si el cliente no responde dentro de `REQUEST_TIMEOUT` (default 30s, configurable por env var), responde `504`.
 
 ### Variables de entorno del bridge
 
 ```env
-SEND_TOKEN=     # token que el cliente debe enviar para conectarse
-RECV_TOKEN=     # token que el bridge devuelve para que el cliente lo verifique
+SEND_TOKEN=        # token que el cliente debe enviar para conectarse
+RECV_TOKEN=        # token que el bridge devuelve para que el cliente lo verifique
+REQUEST_TIMEOUT=30 # segundos de espera por una respuesta del cliente antes de devolver 504
 ```
 
 En Cloud Run, `PORT` lo inyecta la plataforma automáticamente — no hace falta configurarlo. La imagen expone 8080 como fallback para correrla localmente.
@@ -73,7 +123,7 @@ En Cloud Run, `PORT` lo inyecta la plataforma automáticamente — no hace falta
 
 ## Cliente (`client/tunnel.py`)
 
-Script Python que corre como daemon en la máquina local. Toda la configuración viene de variables de entorno — no acepta argumentos de línea de comandos. No expone ningún puerto ni levanta servidor: solo hace una request saliente (`POST /_tunnel/connect`) al bridge y, si tiene éxito, duerme indefinidamente. El bridge es quien reenvía tráfico hacia `TARGET_URL` directamente.
+Script Python que corre como daemon en la máquina local. Toda la configuración viene de variables de entorno — no acepta argumentos de línea de comandos. Abre una conexión WebSocket persistente hacia el bridge y, por cada `http_request` que recibe, hace la llamada real contra `TARGET_URL` (con `httpx`) y devuelve la respuesta por el mismo canal. Procesa requests concurrentes en paralelo (una tarea async por request).
 
 Al arrancar imprime la configuración completa en terminal antes de intentar conectar.
 
@@ -90,8 +140,6 @@ RECONNECT_BACKOFF_MAX=60                    # tope máximo del backoff exponenci
 
 ### Log de arranque
 
-Al iniciar, el cliente imprime toda la configuración activa antes de intentar conectar:
-
 ```
 ╔══════════════════════════════════════════╗
 ║           baxe-tunnel client             ║
@@ -105,11 +153,12 @@ Al iniciar, el cliente imprime toda la configuración activa antes de intentar c
 
 ──────────────────────────────────────────
 [2024-01-15 10:00:00] Conectando...
+[2024-01-15 10:00:00] ✓ Tunnel activo → http://localhost:8000
 ```
 
-Los tokens se muestran truncados — solo los primeros y últimos 3 caracteres — para verificar visualmente que son los correctos sin exponerlos completos.
+Los tokens se muestran truncados — solo los primeros y últimos 3 caracteres.
 
-Si falta alguna variable de entorno requerida, el cliente debe abortar inmediatamente con un mensaje claro indicando cuál falta — nunca conectar con configuración incompleta.
+Si falta alguna variable de entorno requerida, el cliente aborta inmediatamente:
 
 ```
 [2024-01-15 10:00:00] ✗ Variable requerida no encontrada: SEND_TOKEN
@@ -120,19 +169,20 @@ Si falta alguna variable de entorno requerida, el cliente debe abortar inmediata
 
 ## Reconexión automática
 
-El cliente corre como daemon. Solo necesita conectarse una vez al arrancar — después no hace nada más que existir. No hay heartbeat ni polling.
-
 ```
 cliente arranca
     └── imprime configuración en terminal
-    └── loop de conexión con backoff
-            ├── POST /_tunnel/connect
-            │       ├── éxito → queda conectado, duerme indefinidamente
-            │       └── fallo → imprime error y espera backoff
-            └── repetir hasta conectar
+    └── loop de reconexión con backoff
+            ├── conecta WebSocket + handshake
+            │       ├── éxito → backoff se resetea, queda escuchando requests
+            │       │           hasta que la conexión se corte
+            │       └── fallo / rechazo → log de error
+            └── espera backoff, reintenta
 ```
 
-Si el bridge cae, Cloud Run lo levanta solo en el siguiente request (cold start) o mantiene la instancia mínima si está configurada. Si el cliente se reinicia manualmente, al arrancar vuelve a conectarse. El bridge sobreescribe el `target_url` con cada nueva conexión — sin estado que limpiar.
+Cloud Run cierra requests HTTP de larga duración (incluido WebSocket) después de un timeout configurable (hasta 60 minutos) — el cliente reconecta automáticamente cuando eso pase. Mientras el WebSocket está abierto, Cloud Run considera la instancia activa y no la apaga; cuando el cliente se desconecta (PC apagada, `Ctrl+C`), la instancia queda idle y Cloud Run puede escalarla a cero.
+
+No hace falta polling separado para mantener viva la instancia: el WebSocket mismo actúa como keepalive. El ciclo natural es: conexión activa ~60 min → Cloud Run corta por timeout → cliente reconecta de inmediato → otros ~60 min.
 
 ### Backoff exponencial
 
@@ -159,7 +209,7 @@ Este es el único caso donde el daemon **no** reintenta — indica configuració
 ## Notas de seguridad
 
 - Los tokens nunca van en el código fuente — solo en variables de entorno
-- El bridge verifica `SEND_TOKEN` antes de registrar cualquier target
+- El bridge verifica `SEND_TOKEN` antes de aceptar la conexión del cliente
 - El cliente verifica `RECV_TOKEN` antes de aceptar el tunnel — previene MITM
 - Sin token válido en ambos sentidos, el tunnel no se establece
 - Rotar tokens: generar nuevos valores y actualizar env vars en Cloud Run y local
@@ -170,6 +220,21 @@ Este es el único caso donde el daemon **no** reintenta — indica configuració
 
 El bridge es la única pieza que se despliega — el cliente nunca se containeriza ni se sube a la nube, corre siempre en la máquina local.
 
-El despliegue se hace desde la [consola de Google Cloud](https://console.cloud.google.com/run) (ver pasos en el [README](../README.md)), apuntando el servicio al repo. El `Dockerfile` está en la raíz para que Cloud Run lo detecte sin necesidad de indicar un subdirectorio de build. Cloud Run inyecta `PORT` automáticamente; el `Dockerfile` ya escucha en 8080 por defecto.
+Como el bridge mantiene el túnel activo en memoria de proceso, **`max-instances=1` es imprescindible**: si Cloud Run corriera más de una instancia, un request HTTP externo podría caer en una instancia distinta a la que tiene el WebSocket activo y respondería 503.
+
+`min-instances=0` está bien para uso personal — Cloud Run puede escalar a cero cuando el cliente se desconecta (PC apagada). Cuando `tunnel.py` arranca, su conexión WebSocket despierta la instancia. Los primeros 1-3 segundos del cold start pueden dar 503 si llega algo justo en ese momento, pero para uso propio eso es irrelevante.
+
+El timeout hay que subirlo al máximo (60 minutos) para minimizar reconexiones.
+
+```bash
+gcloud run deploy baxe-tunnel-bridge \
+  --source . \
+  --min-instances=0 --max-instances=1 \
+  --timeout=3600 \
+  --allow-unauthenticated \
+  --set-env-vars SEND_TOKEN=...,RECV_TOKEN=...
+```
+
+Nota de costo: con `min-instances=0` el servicio escala a cero cuando no está en uso — solo factura mientras `tunnel.py` está corriendo.
 
 El `.gcloudignore` en la raíz excluye `client/`, docs y archivos no relevantes del build context.
