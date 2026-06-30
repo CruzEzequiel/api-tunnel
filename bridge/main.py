@@ -19,7 +19,7 @@ state = {
     "pending": {},
 }
 
-HOP_BY_HOP_HEADERS = {"host", "content-length"}
+HOP_BY_HOP_HEADERS = {"content-length"}
 
 
 def _resolve_pending(message: dict) -> None:

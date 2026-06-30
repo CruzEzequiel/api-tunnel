@@ -86,17 +86,18 @@ def to_ws_url(bridge_url: str) -> str:
 async def handle_request(config: dict, websocket, message: dict) -> None:
     headers = {k: v for k, v in message["headers"]}
     body = base64.b64decode(message["body_b64"])
-    url = config["TARGET_URL"].rstrip("/") + message["path"]
+
+    params = message["query"]
+    url = httpx.URL(
+        config["TARGET_URL"].rstrip("/") + message["path"],
+        params=params if params else None,
+    )
+    # httpx.Request + send() preserva el Host original sin pisarlo con el de la URL destino.
+    req = httpx.Request(message["method"], url, headers=headers, content=body,
+                        extensions={"timeout": {"connect": 30.0, "read": 30.0, "write": 30.0, "pool": 30.0}})
 
     try:
-        upstream = await target_client.request(
-            message["method"],
-            url,
-            headers=headers,
-            params=message["query"],
-            content=body,
-            timeout=30.0,
-        )
+        upstream = await target_client.send(req)
     except httpx.RequestError as exc:
         response = {
             "type": "http_response",
