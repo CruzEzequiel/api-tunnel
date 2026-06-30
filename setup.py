@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+import secrets
+from pathlib import Path
+
+ROOT = Path(__file__).parent
+ENV_FILE = ROOT / "client" / ".env"
+
+ENV_TEMPLATE = """\
+# Dirección del bridge deployado en Cloud Run
+BRIDGE_URL={bridge_url}
+
+# Puerto local a exponer
+TARGET_URL={target_url}
+
+# Tokens de autenticación mutua
+SEND_TOKEN={send_token}
+RECV_TOKEN={recv_token}
+
+# Reconexión automática
+RECONNECT_BACKOFF=5
+RECONNECT_BACKOFF_MAX=60
+"""
+
+
+def main() -> None:
+    print("╔══════════════════════════════════════════╗")
+    print("║         baxe-tunnel setup                ║")
+    print("╚══════════════════════════════════════════╝")
+    print()
+
+    if ENV_FILE.exists():
+        overwrite = input(f"{ENV_FILE} ya existe. ¿Sobrescribir? [y/N] ")
+        if overwrite.strip().lower() != "y":
+            print("Cancelado.")
+            return
+
+    print("Generando tokens...")
+    send_token = secrets.token_hex(32)
+    recv_token = secrets.token_hex(32)
+    print("✓ SEND_TOKEN y RECV_TOKEN generados")
+    print()
+
+    bridge_url = input(
+        "BRIDGE_URL (URL del bridge en Cloud Run, dejar vacío si aún no lo desplegaste): "
+    ).strip()
+    target_url = input("TARGET_URL [http://localhost:8000]: ").strip() or "http://localhost:8000"
+
+    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ENV_FILE.write_text(
+        ENV_TEMPLATE.format(
+            bridge_url=bridge_url,
+            target_url=target_url,
+            send_token=send_token,
+            recv_token=recv_token,
+        )
+    )
+
+    print(f"✓ {ENV_FILE} creado")
+    print()
+    print("──────────────────────────────────────────")
+    print("Próximo paso — desplegar el bridge en Cloud Run (consola de GCP):")
+    print()
+    print("  1. Cloud Run → Create Service, apuntando a este repo (Dockerfile en la raíz)")
+    print("  2. Allow unauthenticated invocations")
+    print("  3. Variables & Secrets → agregar:")
+    print(f"       SEND_TOKEN = {send_token}")
+    print(f"       RECV_TOKEN = {recv_token}")
+    print()
+    print(f"Luego completá BRIDGE_URL en {ENV_FILE} con la URL que muestre la consola de Cloud Run")
+    print("y arrancá el cliente con: cd client && python tunnel.py")
+
+
+if __name__ == "__main__":
+    main()
