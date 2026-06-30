@@ -3,9 +3,10 @@ import secrets
 from pathlib import Path
 
 ROOT = Path(__file__).parent
-ENV_FILE = ROOT / "client" / ".env"
+CLIENT_ENV = ROOT / "client" / ".env"
+BRIDGE_ENV = ROOT / "bridge" / ".env"
 
-ENV_TEMPLATE = """\
+CLIENT_ENV_TEMPLATE = """\
 # Dirección del bridge deployado en Cloud Run
 BRIDGE_URL={bridge_url}
 
@@ -21,6 +22,14 @@ RECONNECT_BACKOFF=5
 RECONNECT_BACKOFF_MAX=60
 """
 
+BRIDGE_ENV_TEMPLATE = """\
+# Token que el cliente debe enviar para conectarse
+SEND_TOKEN={send_token}
+
+# Token que el bridge devuelve para que el cliente lo verifique
+RECV_TOKEN={recv_token}
+"""
+
 
 def main() -> None:
     print("╔══════════════════════════════════════════╗")
@@ -28,8 +37,9 @@ def main() -> None:
     print("╚══════════════════════════════════════════╝")
     print()
 
-    if ENV_FILE.exists():
-        overwrite = input(f"{ENV_FILE} ya existe. ¿Sobrescribir? [y/N] ")
+    if CLIENT_ENV.exists() or BRIDGE_ENV.exists():
+        existing = [str(f) for f in (CLIENT_ENV, BRIDGE_ENV) if f.exists()]
+        overwrite = input(f"{', '.join(existing)} ya existe(n). ¿Sobrescribir? [y/N] ")
         if overwrite.strip().lower() != "y":
             print("Cancelado.")
             return
@@ -45,17 +55,25 @@ def main() -> None:
     ).strip()
     target_url = input("TARGET_URL [http://localhost:8000]: ").strip() or "http://localhost:8000"
 
-    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
-    ENV_FILE.write_text(
-        ENV_TEMPLATE.format(
+    CLIENT_ENV.parent.mkdir(parents=True, exist_ok=True)
+    CLIENT_ENV.write_text(
+        CLIENT_ENV_TEMPLATE.format(
             bridge_url=bridge_url,
             target_url=target_url,
             send_token=send_token,
             recv_token=recv_token,
         )
     )
+    BRIDGE_ENV.parent.mkdir(parents=True, exist_ok=True)
+    BRIDGE_ENV.write_text(
+        BRIDGE_ENV_TEMPLATE.format(
+            send_token=send_token,
+            recv_token=recv_token,
+        )
+    )
 
-    print(f"✓ {ENV_FILE} creado")
+    print(f"✓ {CLIENT_ENV} creado")
+    print(f"✓ {BRIDGE_ENV} creado")
     print()
     print("──────────────────────────────────────────")
     print("Próximo paso — desplegar el bridge en Cloud Run (consola de GCP):")
@@ -66,7 +84,7 @@ def main() -> None:
     print(f"       SEND_TOKEN = {send_token}")
     print(f"       RECV_TOKEN = {recv_token}")
     print()
-    print(f"Luego completá BRIDGE_URL en {ENV_FILE} con la URL que muestre la consola de Cloud Run")
+    print(f"Luego completá BRIDGE_URL en {CLIENT_ENV} con la URL que muestre la consola de Cloud Run")
     print("y arrancá el cliente con: cd client && python tunnel.py")
 
 
