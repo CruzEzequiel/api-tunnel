@@ -81,7 +81,7 @@ curl https://tu-bridge.run.app/_tunnel/status
 | Variable | Descripción | Default |
 |----------|-------------|---------|
 | `BRIDGE_URL` | URL del bridge en Cloud Run | — (requerida) |
-| `TARGET_URL` | Puerto/servicio local a exponer | — (requerida) |
+| `TARGET_URL` | Dirección local adonde el bridge redirige el tráfico entrante (ej. `http://localhost:8000`) | — (requerida) |
 | `SEND_TOKEN` | Token que se envía al bridge | — (requerida) |
 | `RECV_TOKEN` | Token que se espera del bridge | — (requerida) |
 | `RECONNECT_BACKOFF` | Espera inicial entre reintentos (seg) | `5` |

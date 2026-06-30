@@ -53,7 +53,7 @@ def main() -> None:
     bridge_url = input(
         "BRIDGE_URL (URL del bridge en Cloud Run, dejar vacío si aún no lo desplegaste): "
     ).strip()
-    target_url = input("TARGET_URL [http://localhost:8000]: ").strip() or "http://localhost:8000"
+    target_url = input("TARGET_URL — dirección local adonde el bridge redirige el tráfico entrante [http://localhost:8000]: ").strip() or "http://localhost:8000"
 
     CLIENT_ENV.parent.mkdir(parents=True, exist_ok=True)
     CLIENT_ENV.write_text(
@@ -78,11 +78,6 @@ def main() -> None:
     print("──────────────────────────────────────────")
     print("Próximo paso — desplegar el bridge en Cloud Run (consola de GCP):")
     print()
-    print("  1. Cloud Run → Create Service, apuntando a este repo (Dockerfile en la raíz)")
-    print("  2. Allow unauthenticated invocations")
-    print("  3. Variables & Secrets → agregar:")
-    print(f"       SEND_TOKEN = {send_token}")
-    print(f"       RECV_TOKEN = {recv_token}")
     print()
     print(f"Luego completá BRIDGE_URL en {CLIENT_ENV} con la URL que muestre la consola de Cloud Run")
     print("y arrancá el cliente con: cd client && python tunnel.py")
