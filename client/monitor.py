@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import base64
 import asyncio
+import base64
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -119,18 +119,37 @@ HTML = """<!doctype html>
       text-overflow: ellipsis;
       white-space: nowrap;
     }
-    .meta {
+    .actions {
+      display: flex;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+    .btn {
+      padding: 6px 14px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+      color: var(--text);
+      font: inherit;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .btn:hover { background: var(--selected); }
+.meta {
       color: var(--muted);
       white-space: nowrap;
     }
     main {
       display: grid;
       grid-template-columns: minmax(360px, 45%) 1fr;
-      min-height: calc(100vh - 57px);
+      height: calc(100vh - 57px);
+      overflow: hidden;
     }
     .list, .detail {
       min-width: 0;
       padding: 14px;
+      overflow-y: auto;
+      height: 100%;
     }
     .list {
       border-right: 1px solid var(--line);
@@ -153,6 +172,10 @@ HTML = """<!doctype html>
       font-weight: 700;
       text-transform: uppercase;
       letter-spacing: .04em;
+      position: sticky;
+      top: 0;
+      background: var(--panel);
+      z-index: 1;
     }
     tr.request-row {
       cursor: pointer;
@@ -190,13 +213,30 @@ HTML = """<!doctype html>
       padding: 14px;
       border-bottom: 1px solid var(--line);
     }
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }
     h2 {
-      margin: 0 0 8px;
+      margin: 0;
       color: var(--muted);
       font-size: 12px;
       text-transform: uppercase;
       letter-spacing: .04em;
     }
+    .copy-btn {
+      padding: 2px 10px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: var(--panel);
+      color: var(--muted);
+      font: 12px system-ui, sans-serif;
+      cursor: pointer;
+    }
+    .copy-btn:hover { color: var(--text); background: var(--selected); }
+    .copy-btn.copied { color: var(--good); border-color: var(--good); }
     pre {
       margin: 0;
       white-space: pre-wrap;
@@ -219,7 +259,10 @@ HTML = """<!doctype html>
       <span id="status-text">Conectando...</span>
       <span id="target" class="target"></span>
     </div>
-    <div id="meta" class="meta">0 requests</div>
+    <div class="actions">
+      <span id="meta" class="meta">0 requests</span>
+      <button class="btn" onclick="clearLogs()">Borrar logs</button>
+    </div>
   </header>
   <main>
     <div class="list">
@@ -273,8 +316,11 @@ HTML = """<!doctype html>
       document.getElementById("dot").classList.toggle("connected", state.connected);
       document.getElementById("status-text").textContent = state.connected ? "Tunnel activo" : "Conectando...";
       document.getElementById("target").textContent = `-> ${state.target_url}`;
-      document.getElementById("meta").textContent = `${entries.length} requests`;
+      document.getElementById("meta").textContent = `${entries.length} request${entries.length !== 1 ? "s" : ""}`;
+      const list = document.querySelector(".list");
+      const wasAtBottom = list.scrollTop + list.clientHeight >= list.scrollHeight - 40;
       renderRows();
+      if (wasAtBottom) list.scrollTop = list.scrollHeight;
 
       if (selectedId) {
         const stillExists = entries.some(entry => entry.id === selectedId);
@@ -310,17 +356,47 @@ HTML = """<!doctype html>
       const entry = await res.json();
       const status = entry.status ?? "ERR";
       const elapsed = entry.elapsed_ms ?? "-";
+      const reqBody = bodyText(entry.request_body);
+      const resBody = bodyText(entry.response_body);
       document.getElementById("detail").innerHTML = `
         <div class="detail-head">${esc(entry.method)} ${esc(status)} ${esc(elapsed)}ms ${esc(entry.path)}</div>
-        <section><h2>Request headers</h2><pre>${esc(headersText(entry.request_headers))}</pre></section>
-        <section><h2>Request body</h2><pre>${esc(bodyText(entry.request_body))}</pre></section>
-        <section><h2>Response headers</h2><pre>${esc(headersText(entry.response_headers))}</pre></section>
-        <section><h2>Response body</h2><pre>${esc(bodyText(entry.response_body))}</pre></section>
+        <section>
+          <div class="section-head"><h2>Request headers</h2><button class="copy-btn" data-copy="${esc(headersText(entry.request_headers))}">Copiar</button></div>
+          <pre>${esc(headersText(entry.request_headers))}</pre>
+        </section>
+        <section>
+          <div class="section-head"><h2>Request body</h2><button class="copy-btn" data-copy="${esc(reqBody)}">Copiar</button></div>
+          <pre>${esc(reqBody)}</pre>
+        </section>
+        <section>
+          <div class="section-head"><h2>Response headers</h2><button class="copy-btn" data-copy="${esc(headersText(entry.response_headers))}">Copiar</button></div>
+          <pre>${esc(headersText(entry.response_headers))}</pre>
+        </section>
+        <section>
+          <div class="section-head"><h2>Response body</h2><button class="copy-btn" data-copy="${esc(resBody)}">Copiar</button></div>
+          <pre>${esc(resBody)}</pre>
+        </section>
         ${entry.error ? `<section><h2>Error</h2><pre class="error">${esc(entry.error)}</pre></section>` : ""}
       `;
+      document.querySelectorAll(".copy-btn").forEach(btn => {
+        btn.addEventListener("click", () => {
+          navigator.clipboard.writeText(btn.dataset.copy).then(() => {
+            btn.textContent = "Copiado";
+            btn.classList.add("copied");
+            setTimeout(() => { btn.textContent = "Copiar"; btn.classList.remove("copied"); }, 1500);
+          });
+        });
+      });
     }
 
-    loadState().catch(console.error);
+    async function clearLogs() {
+      await fetch("/api/clear", { method: "POST" });
+      selectedId = null;
+      document.getElementById("detail").innerHTML = "<div class='detail-head'>Selecciona un request</div>";
+      await loadState();
+    }
+
+loadState().catch(console.error);
     setInterval(() => loadState().catch(console.error), 1000);
   </script>
 </body>
@@ -342,6 +418,7 @@ class MonitorServer:
 
     async def start(self) -> None:
         handler = self._make_handler()
+        ThreadingHTTPServer.allow_reuse_address = True
         self.server = ThreadingHTTPServer(("127.0.0.1", self.port), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -390,6 +467,15 @@ class MonitorServer:
                         self._send_text("Request not found", "text/plain; charset=utf-8", status=404)
                         return
                     self._send_json(_entry_detail(entry))
+                    return
+                self._send_text("Not found", "text/plain; charset=utf-8", status=404)
+
+            def do_POST(self) -> None:
+                path = urlparse(self.path).path
+                if path == "/api/clear":
+                    with monitor.log._lock:
+                        monitor.log._entries.clear()
+                    self._send_json({"ok": True})
                     return
                 self._send_text("Not found", "text/plain; charset=utf-8", status=404)
 
