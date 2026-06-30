@@ -88,11 +88,18 @@ async def handle_request(config: dict, websocket, message: dict) -> None:
     body = base64.b64decode(message["body_b64"])
 
     params = message["query"]
+    target = httpx.URL(config["TARGET_URL"].rstrip("/"))
     url = httpx.URL(
         config["TARGET_URL"].rstrip("/") + message["path"],
         params=params if params else None,
     )
-    # httpx.Request + send() preserva el Host original sin pisarlo con el de la URL destino.
+
+    # el host original va en x-forwarded-host; el local server ve solo su propio host
+    original_host = headers.get("host", headers.get("Host", ""))
+    if original_host:
+        headers["x-forwarded-host"] = original_host
+    headers["host"] = target.host if not target.port else f"{target.host}:{target.port}"
+
     req = httpx.Request(message["method"], url, headers=headers, content=body,
                         extensions={"timeout": {"connect": 30.0, "read": 30.0, "write": 30.0, "pool": 30.0}})
 
